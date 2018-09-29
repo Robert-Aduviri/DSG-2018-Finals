@@ -1,4 +1,8 @@
 from sklearn.model_selection import train_test_split
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import log_loss
 
 def generate_validation_set(session, tracking, test_size=0.1, seed=42):
     '''
@@ -11,131 +15,74 @@ def generate_validation_set(session, tracking, test_size=0.1, seed=42):
     val_tracking = tracking[tracking.sid.apply(lambda x: x in val_session_ids)]
     return trn_session, trn_tracking, val_session, val_tracking
 
-def add_num_skus(session, tracking):
-    sku_counts = tracking.groupby('sid')['sku'].nunique()
-    session['NUM_SKUS'] = session.sid.map(sku_counts)
+def print_results(trn_logloss, val_logloss):
+    print(f'Train logloss: {100*np.mean(trn_logloss):.2f} +/- {200*np.std(trn_logloss):.2f} | '
+          f'Val logloss: {100*np.mean(val_logloss):.2f} +/- {200*np.std(val_logloss):.2f}')
     
-from torch.utils.data import Dataset
-import torch.nn as nn
-import torch.nn.functional as F
-    
-class MultimodalDataset(Dataset):
-    def __init__(self, cats, conts, cat_seqs, cont_seqs, targets=None):
-        self.cats = cats.values.astype(np.int64)
-        self.conts = conts.values.astype(np.float32)
-        self.cat_seqs = np.array(cat_seqs).astype(np.float32)
-        self.cont_seqs = np.array(cont_seqs).astype(np.float32)
-        self.targets = np.array(targets).astype(np.float32) \
-                            if targets is not None else \
-                            np.zeros(len(cats)).astype(np.float32)
-    
-    def __len__(self):
-        return len(self.cats)
-    
-    def __getitem__(self, idx):
-        return [self.cats[idx], self.conts[idx],
-                self.cat_seqs[idx], self.cont_seqs[idx], self.targets[idx]]
 
-class StructuredNet(nn.Module):
-    def __init__(self, emb_szs, n_cont, emb_drop, szs, drops, out_sz):
-        super().__init__()        
-        self.embs = nn.ModuleList([
-            nn.Embedding(c, s) for c,s in emb_szs
-        ])
-        for emb in self.embs:
-            self.emb_init(emb)
-        n_emb = sum(e.embedding_dim for e in self.embs)
-        self.n_emb, self.n_cont = n_emb, n_cont
-        szs = [n_emb + n_cont] + szs
-        self.lins = nn.ModuleList([
-            nn.Linear(szs[i], szs[i+1]) for i in range(len(szs)-1)
-        ])
-        for o in self.lins:
-            nn.init.kaiming_normal_(o.weight.data)
-        self.bns = nn.ModuleList([
-            nn.BatchNorm1d(sz) for sz in szs[1:]
-        ])
-        self.outp = nn.Linear(szs[-1], out_sz)
-        nn.init.kaiming_normal_(self.outp.weight.data)
-        self.emb_drop = nn.Dropout(emb_drop)
-        self.drops = nn.ModuleList([
-            nn.Dropout(drop) for drop in drops
-        ])
-        self.bn = nn.BatchNorm1d(n_cont)
-        
-    def forward(self, x_cat, x_cont):
-        x = [emb(x_cat[:,i]) for i,emb in enumerate(self.embs)]
-        x = torch.cat(x, 1)
-        x = self.emb_drop(x)
-        x2 = self.bn(x_cont)
-        x = torch.cat([x, x2], 1) if self.n_emb != 0 else x2
-        for lin, drop, bn in zip(self.lins, self.drops, self.bns):
-            x = F.relu(lin(x))
-            x = bn(x)
-            x = drop(x)
-        return self.outp(x)
+def test_lgbm(lgbm, params, X, y, X_test, test_size, random_seeds = [42], cat_features=[]):
+    trn_logloss, val_logloss = [], []
+    y_pred = np.zeros(len(X))
+    y_test = np.zeros(len(X_test))
+    idx = 0
+    for random_seed in random_seeds:
+        X_train, X_val, y_train, y_val  = train_test_split(X, 
+                                                           y, 
+                                                           test_size=test_size, 
+                                                           random_state=random_seed, 
+                                                           shuffle=True)
     
-    def emb_init(self, x):
-        x = x.weight.data
-        sc = 2 / (x.size(1) + 1)
-        x.uniform_(-sc, sc)    
-    
-class MultimodalNet(nn.Module):
-    def __init__(self, emb_szs, n_cont, emb_drop, szs, drops, 
-                 rnn_hidden_sz, rnn_cont_sz, rnn_emb_sz, rnn_n_layers,
-                 rnn_drop, out_sz=1):
-        super().__init__()
-        self.structured_net = StructuredNet(emb_szs, n_cont=n_cont, 
-                        emb_drop=emb_drop, szs=szs, drops=drops, 
-                        out_sz=rnn_hidden_sz)
+        num_rounds = 10000
+        d_train = lgbm.Dataset(X_train, y_train)
+        d_valid = lgbm.Dataset(X_val, y_val)
+        bst = lgbm.train(params, d_train, 
+                         num_rounds, [
+                             d_valid], 
+                         early_stopping_rounds=30, 
+                         # categorical_features = cat_features, 
+                         verbose_eval=False)
+        y_trn_pred = bst.predict(X_train)
+        y_val_pred = bst.predict(X_val)
+        trn_logloss.append(log_loss(y_train, y_trn_pred))
+        val_logloss.append(log_loss(y_val, y_val_pred))
+        print(f'No. estimators: {bst.best_iteration} | '
+                  f'Train log loss: {trn_logloss[-1]} | '
+                  f'Val log loss: {val_logloss[-1]}')
         
-        
-        self.embeddings = nn.Embedding(self.rnn_input_sz, rnn_emb_sz)
-        
-        self.lstm = nn.LSTM(rnn_input_sz, rnn_hidden_sz, rnn_n_layers, 
-                            dropout=rnn_drop)
-        self.out = nn.Linear(rnn_hidden_sz * 2, out_sz) # [struct_out, rnn_out]
-        
-        self.rnn_n_layers = rnn_n_layers
-        self.rnn_hidden_sz = rnn_hidden_sz
-        
-    def forward(self, cats, conts, cat_seqs, cont_seqs, hidden):
-        # cont_seqs: [bs, inp, seq]
-        # cat_seqs: [bs, inp, seq]
-        x = self.structured_net(cats, conts) # [bs, hs]
-        # cell = x.unsqueeze(0).repeat(self.rnn_n_layers, 1, 1) # [nlay, bs, hs]
-        cell = x.unsqueeze(0).expand(self.rnn_n_layers, -1, -1).contiguous()
-        
-        # TODO: cat_seqs embeddings
-        seqs = seqs.transpose(1,0).transpose(2,0) # .unsqueeze(2) 
-        # seqs: [seq, bs, inp]
-        outputs, hidden = self.lstm(seqs, (hidden, cell))
-        out = self.out(torch.cat([x, outputs[-1]], 1)) # [struct_out, rnn_out]
-        return out
-        
-    def init_hidden(self, batch_sz):
-        return torch.zeros(self.rnn_n_layers, batch_sz, self.rnn_hidden_sz)
-    
-def train_step(model, cats, conts, cat_seqs, cont_seqs, hidden, 
-               targets, optimizer, criterion):
-    model.train()
-    optimizer.zero_grad()
-    preds = model(cats, conts, cat_seqs, cont_seqs, hidden)
-    loss = criterion(preds.view(-1), targets)
-    loss.backward()
-    optimizer.step()
-    return loss.item()
+        y_tst_pred = bst.predict(X_test)
+        y_test += y_tst_pred
+        y_pred = y_val_pred
+        idx += 1
+    print()
+    print_results(trn_logloss, val_logloss)
+    print()
+    return y_test / len(random_seeds), y_pred
 
-def eval_model(model, data_loader, USE_CUDA=False):
-    targets, preds = [], [] 
-    model.eval()
-    for batch_idx, (cats, conts, cat_seqs, cont_seqs, target) in enumerate(data_loader):
-        with torch.no_grad():
-            if USE_CUDA:
-                cats, conts, target = cats.cuda(), conts.cuda(), target.cuda()
-            pred = model(cats, conts)
-            targets.extend(target.cpu())
-            preds.extend(pred.cpu())
-            assert len(targets) == len(preds)
-    return [x.item() for x in targets], [F.sigmoid(x).item() for x in preds]
-    
+def test_catboost(model, X, y, X_test, test_size, random_seeds = [42], cat_features=[]):
+    trn_logloss, val_logloss = [], []
+    y_pred = np.zeros(len(X))
+    y_test = np.zeros(len(X_test))
+    for random_seed in random_seeds:
+        X_trn, X_val, y_trn, y_val  = train_test_split(X, 
+                                                           y, 
+                                                           test_size=test_size, 
+                                                           random_state=random_seed, 
+                                                           shuffle=True)
+        model.fit(X_trn, y_trn, eval_set=[(X_val, y_val)],
+                  use_best_model=True, cat_features=cat_features, 
+                  verbose=False, early_stopping_rounds=30)
+        y_trn_pred = model.predict_proba(X_trn)[:,1]
+        y_val_pred = model.predict_proba(X_val)[:,1]
+        trn_logloss.append(log_loss(y_trn, y_trn_pred))
+        val_logloss.append(log_loss(y_val, y_val_pred))
+        print(f'No. estimators: {model.tree_count_} | '
+                  f'Train log loss: {trn_logloss[-1]} | '
+                  f'Val log loss: {val_logloss[-1]}')
+        
+        y_tst_pred = model.predict_proba(X_test)[:,1]
+        y_test += y_tst_pred
+        
+    print()
+    print_results(trn_logloss, val_logloss)
+    print()
+    return y_test / len(random_seeds), y_pred
